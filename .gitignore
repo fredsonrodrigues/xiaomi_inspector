@@ -1,0 +1,6 @@
+# Downloaded automatically on first ADB operation.
+platform-tools/
+
+# Temporary independent runs; keep the curated historical results/ directory if tracked.
+results_*/
+/results
