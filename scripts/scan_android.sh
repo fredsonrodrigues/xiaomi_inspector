@@ -34,7 +34,9 @@ printf 'Serial: %s\n' "$SERIAL" >> "$SCAN"
 printf 'Coletado em: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$SCAN"
 
 # Identidade filtrada; este arquivo nao deve ser publicado.
-adb_cmd shell getprop > "$TMP/getprop.txt" 2>&1
+adb_cmd shell getprop > "$TMP/getprop.txt" 2>&1 || {
+  printf 'Falha ao ler identidade do aparelho.\n' >&2; exit 4
+}
 grep -E '^\[(ro\.product\.(model|manufacturer|device|first_api_level)|ro\.(build|system\.build)\.(version\.release|display\.id|version\.security_patch|tags|type|fingerprint)|ro\.vendor\.build\.security_patch|ro\.(soc\.model|board\.platform|secure|debuggable|adb\.secure)|ro\.boot\.(verifiedbootstate|flash\.locked|warranty_bit|vbmeta\.device_state|veritymode)|ro\.miui\.|ro\.product\.mod_device)' "$TMP/getprop.txt" > "$DEVICE" || true
 
 section "IDENTIDADE E INTEGRIDADE (getprop filtrado)"
@@ -44,7 +46,12 @@ run_shell "USUARIOS" pm list users
 run_shell "DEVICE POLICY" dumpsys device_policy
 
 section "APPS ATIVOS -- USER 0"
-adb_cmd shell pm list packages -e --user 0 > "$BEFORE" 2>&1
+adb_cmd shell pm list packages -e --user 0 > "$BEFORE" 2>&1 || {
+  printf 'Falha ao coletar inventario; plano/aplicacao interrompidos.\n' >&2; exit 4
+}
+grep -q '^package:android' "$BEFORE" || {
+  printf 'Inventario vazio ou invalido; plano/aplicacao interrompidos.\n' >&2; exit 4
+}
 cat "$BEFORE" >> "$SCAN"
 run_shell "APPS DESATIVADOS -- USER 0" pm list packages -d --user 0
 run_shell "APPS DE SISTEMA -- USER 0" pm list packages -s --user 0

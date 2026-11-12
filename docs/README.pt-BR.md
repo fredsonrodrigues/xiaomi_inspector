@@ -2,7 +2,7 @@
 
 [English documentation](../README.md)
 
-Ferramenta em shell para diagnosticar, planejar, aplicar e verificar uma limpeza controlada em um **Xiaomi Mi 8 Lite (`platina`)**, sem root.
+Ferramenta em shell para diagnosticar, planejar, aplicar e verificar uma limpeza controlada em aparelhos Xiaomi, Redmi e POCO, sem root.
 
 O ponto de entrada é [`xiaomi_inspector.sh`](../xiaomi_inspector.sh). Ele coordena a varredura, gera um plano, exige aprovação antes de mudanças, registra hashes e alterações, cria scripts de restauração e comprova o estado depois do reinício.
 
@@ -33,18 +33,23 @@ O programa **não**:
 - desativa Play Protect ou mecanismos de segurança do sistema;
 - atualiza o patch de segurança do Android.
 
-## Limitação de modelo
+## Identificação automática
 
-A varredura pode ler outros aparelhos Android, mas os comandos `plan`, `apply`, `reboot-verify` e `restore` foram preparados para o aparelho analisado neste projeto:
+Xiaomi, Redmi e POCO usam o mesmo fluxo e o perfil atual. O programa identifica
+fabricante, modelo e codinome; `eos` e `platina` não precisam de comandos distintos.
+O suporte ao fabricante não garante compatibilidade com todos os firmwares:
+uma falha interrompe o fluxo.
 
-- Xiaomi Mi 8 Lite;
-- codinome `platina`;
-- Android 10 / MIUI 12 Global;
-- usuário principal 0;
-- Segundo Espaço nos usuários 11/999;
-- seleção de apps e serviços definida durante o diagnóstico.
+O perfil mantém os grupos aprovados A → F → B → D → C → E. A remoção depende
+de o pacote estar instalado e marcado para remoção no plano. Apps ausentes são
+ignorados, o launcher padrão é identificado e a verificação compara o inventário
+inicial com as remoções registradas. Revise o plano: ele ainda representa as
+escolhas do proprietário, incluindo Google Fotos, CAIXA, My Vodafone e serviços
+de nuvem/compartilhamento Xiaomi.
 
-A etapa `apply` verifica `ro.product.device` e **recusa outro modelo**. Não reutilize a lista de remoção em outro celular sem uma nova análise.
+Cada varredura grava o serial em `device_serial.txt`; as etapas seguintes
+recusam resultados de outro aparelho. Use uma pasta nova por execução completa.
+Uma pasta que já contém registro de aplicação não pode receber outra varredura.
 
 ## Requisitos
 
@@ -99,16 +104,91 @@ Se houver mais de um aparelho conectado, informe o serial explicitamente:
 ### Fluxo completo
 
 ```sh
-./xiaomi_inspector.sh all --out results_new_run
+./xiaomi_inspector.sh
+# Ou escolha a pasta explicitamente:
+./xiaomi_inspector.sh --out results/meu_aparelho
 ```
 
-O fluxo é:
+Sem subcomando, o programa cria uma pasta exclusiva
+`results/run_DATA_HORA_PID/` e executa:
 
 ```text
-scan → revisão → plan → aprovação → apply → reinício → repouso → verificação
+identificar → scan → plan → aprovação → apply → reinício → repouso → verificação → report
 ```
 
-Mesmo no modo `all`, o programa pausa e exige frases de confirmação antes de aplicar mudanças e antes de reiniciar.
+O fluxo pede confirmação antes de aplicar e reiniciar. Para uma execução já
+aprovada e sem interação, use `--yes`:
+
+```sh
+./xiaomi_inspector.sh --out results/meu_aparelho --yes
+```
+
+`run`, `all` e `full` são aliases do mesmo fluxo completo.
+**Mudança de comportamento:** `all` agora inclui limpeza e reinício; use `scan`
+para uma auditoria somente leitura.
+
+Se uma etapa falhar, retome no mesmo aparelho e pasta:
+
+```sh
+./xiaomi_inspector.sh --out results/meu_aparelho --resume
+```
+
+Grupos de limpeza concluídos são ignorados. Se a remoção do ShareMe
+(`com.xiaomi.midrop`) retornar `Failure [-1000]` e o pacote continuar instalado,
+o fluxo tenta `pm disable-user --user 0`. Ele verifica a lista de desativados e
+o launcher, registra o pacote em `disabled.txt` (não em `removed.txt`) e gera
+comandos para restaurar o estado de ativação anterior. Se o ShareMe já estava
+desativado, mantém esse estado sem gerar comando para reativá-lo. Se a
+desativação ou a verificação falhar, o grupo para e tenta reverter suas mudanças.
+A verificação final também confirma que o ShareMe continua desativado.
+
+A alternativa vale somente para o ShareMe e essa resposta de desinstalação.
+Outros pacotes com `Failure [-1000]` continuam preservados em `skipped.txt`;
+outros erros interrompem o fluxo. Uma retomada ignora grupos concluídos antes
+dessa mudança; use uma execução nova para avaliar o perfil atualizado.
+Se a primeira escrita de rede for recusada por `WRITE_SECURE_SETTINGS`, o grupo
+de rede fica pendente e o fluxo continua. Configure DNS privado e scans Wi-Fi/BLE
+manualmente nesse aparelho; o resumo inclui a pendência.
+Para retomar uma execução automática, informe em `--out` a pasta exibida pelo
+programa. As etapas individuais continuam usando `results/` por padrão.
+
+### Apps Xiaomi padrão e remoções adicionais
+
+Estes apps entram na limpeza por padrão. Se o pacote não existir, o fluxo segue:
+
+| App | Pacote |
+|---|---|
+| Centro de Jogos | `com.xiaomi.glgm` |
+| Mi Picks / GetApps | `com.xiaomi.mipicks` |
+| Comunidade Xiaomi | `com.mi.global.bbs` |
+
+```sh
+./xiaomi_inspector.sh
+```
+
+Para adicionar qualquer outro app instalado, repita `--remove-app` com o pacote
+completo. Não há lista restrita de pacotes. Exemplo (substitua os nomes):
+
+```sh
+./xiaomi_inspector.sh --remove-app org.example.reader --remove-app com.example.other
+```
+
+O comando executa o fluxo completo com suas confirmações. A seleção explícita
+prevalece sobre as classificações de manter/proteger; revise pacote, dependências
+e dados locais antes de confirmar. Para apenas revisar, execute
+`scan --out results/revisao` e depois
+`plan --out results/revisao --remove-app org.example.reader`.
+
+As escolhas adicionais ficam em `optional_removals.txt`. O plano usa nomes
+exatos presentes no inventário, incluindo apps desativados selecionados
+explicitamente. Pacotes ausentes são ignorados. Nomes inválidos, curingas,
+espaços e expressões de shell são rejeitados. O grupo adicional usa os mesmos registros,
+validação do launcher, reversão e verificação final dos demais grupos.
+Selecione durante `plan` ou uma execução nova; `apply` e `--resume` usam o plano
+salvo e não aceitam novas escolhas.
+
+A investigação dos domínios está em
+[Endpoint audit — 2026-11-12](network/ENDPOINT_AUDIT_2026-11-12.md).
 
 ### Execução por etapas
 
@@ -259,6 +339,9 @@ As opções podem ser usadas em qualquer etapa aplicável:
 ```sh
 --serial SERIAL
 --out DIRETORIO
+--yes       # Confirma aplicação e reinício numa execução já aprovada
+--resume    # Retoma a execução no mesmo aparelho e pasta
+--remove-app PACOTE # Seleção opcional; pode ser repetida
 ```
 
 Também é possível definir:
@@ -282,14 +365,18 @@ OUT="$PWD/results_test" \
 
 | Arquivo | Conteúdo |
 |---|---|
+| `device_serial.txt` | Vincula a execução ao aparelho escaneado |
 | `device.txt` | Propriedades filtradas do aparelho; não publicar |
 | `scan.txt` | Coleta ADB bruta e sanitizada |
 | `before.txt` | Pacotes ativos antes da aplicação |
 | `uad_lists.json` | Cópia local da lista pública UAD-NG |
 | `app_plan.tsv` | Classificação dos pacotes ativos |
+| `optional_removals.txt` | Pacotes opcionais selecionados na geração do plano |
 | `measurements.txt` | Armazenamento, RAM, temperatura e contagens antes/depois |
 | `changes.txt` | Comandos, resultados e hashes SHA-256 |
 | `removed.txt` | Apenas pacotes efetivamente removidos do usuário 0 |
+| `disabled.txt` | Pacotes instalados, mas desativados pelo workaround do ShareMe |
+| `skipped.txt` | Remoções recusadas e configurações pendentes |
 | `restore.sh` | Reversão para macOS/Linux |
 | `restore.bat` | Reversão para Windows |
 | `final_verification.txt` | Verificações após o reinício |
@@ -298,7 +385,7 @@ OUT="$PWD/results_test" \
 Use uma pasta de resultados diferente para cada execução importante:
 
 ```sh
-./xiaomi_inspector.sh all --out "results_$(date +%Y%m%d)"
+./xiaomi_inspector.sh --out "results/run_$(date +%Y%m%d_%H%M%S)"
 ```
 
 ## Privacidade

@@ -1,5 +1,5 @@
 #!/bin/sh
-set -u
+set -eu
 
 SERIAL="${1:?serial obrigatorio}"
 ADB="${2:-./platform-tools/adb}"
@@ -10,6 +10,9 @@ REMOVED="$OUT/removed.txt"
 MEASURES="$OUT/measurements.txt"
 RESTORE_BAT="$OUT/restore.bat"
 RESTORE_SH="$OUT/restore.sh"
+HOME_COMPONENT=$("$ADB" -s "$SERIAL" shell cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME | tr -d '\r' | tail -n 1)
+HOME_PACKAGE=${HOME_COMPONENT%%/*}
+case "$HOME_COMPONENT" in */*) ;; *) printf 'Launcher padrao nao identificado.\n' >&2; exit 9 ;; esac
 
 adb_cmd() { "$ADB" -s "$SERIAL" "$@" < /dev/null; }
 now() { date '+%Y-%m-%d %H:%M:%S %Z'; }
@@ -24,13 +27,14 @@ home_ok() {
   sleep 1
   focus="$(adb_cmd shell dumpsys window 2>/dev/null | grep -m 1 -E 'mCurrentFocus|mFocusedApp' || true)"
   log "Foco apos grupo: $focus"
-  printf '%s' "$focus" | grep -q 'com.miui.home'
+  printf '%s' "$focus" | grep -Fq "$HOME_PACKAGE/"
 }
 
 record_restore_appops() {
   pkg="$1"
-  printf '"%%ADB%%" -s %%SERIAL%% shell cmd appops set %s REQUEST_INSTALL_PACKAGES allow\n' "$pkg" >> "$RESTORE_BAT"
-  printf '"$ADB" -s "$SERIAL" shell cmd appops set %s REQUEST_INSTALL_PACKAGES allow\n' "$pkg" >> "$RESTORE_SH"
+  mode="$2"
+  printf '"%%ADB%%" -s %%SERIAL%% shell cmd appops set --user 0 %s REQUEST_INSTALL_PACKAGES %s\n' "$pkg" "$mode" >> "$RESTORE_BAT"
+  printf '"$ADB" -s "$SERIAL" shell cmd appops set --user 0 %s REQUEST_INSTALL_PACKAGES %s\n' "$pkg" "$mode" >> "$RESTORE_SH"
 }
 
 record_restore_package() {
@@ -66,33 +70,39 @@ measure_snapshot() {
 }
 
 rollback_appops() {
-  for pkg in "$@"; do
-    adb_cmd shell cmd appops set "$pkg" REQUEST_INSTALL_PACKAGES allow >/dev/null 2>&1 || true
-    log "ROLLBACK appops allow: $pkg"
+  for entry in "$@"; do
+    pkg=${entry%:*}
+    mode=${entry##*:}
+    adb_cmd shell cmd appops set --user 0 "$pkg" REQUEST_INSTALL_PACKAGES "$mode" >/dev/null 2>&1 || true
+    log "ROLLBACK appops $mode: $pkg"
   done
 }
 
 apply_group_a() {
   changed=""
   for pkg in com.android.chrome com.brave.browser com.google.android.apps.docs com.miui.gallery; do
-    before="$(adb_cmd shell cmd appops get "$pkg" REQUEST_INSTALL_PACKAGES 2>&1 | tr '\n' ' ')"
+    if ! exact_package_present "$pkg"; then log "A ignorado (ausente): $pkg"; continue; fi
+    before="$(adb_cmd shell cmd appops get --user 0 "$pkg" REQUEST_INSTALL_PACKAGES 2>&1 | tr '\n' ' ')"
+    old_appop=$(printf '%s' "$before" | sed -n 's/.*REQUEST_INSTALL_PACKAGES: \([a-z]*\).*/\1/p')
+    old_appop=${old_appop:-default}
+    case "$old_appop" in allow|deny|ignore|default|foreground) ;; *) log "Modo appops desconhecido: $before"; return 1 ;; esac
     log "A antes $pkg: $before"
     if printf '%s' "$before" | grep -q 'deny'; then
       log "A ja aplicado anteriormente: $pkg"
       continue
     fi
-    if ! adb_cmd shell cmd appops set "$pkg" REQUEST_INSTALL_PACKAGES deny >> "$CHANGES" 2>&1; then
+    if ! adb_cmd shell cmd appops set --user 0 "$pkg" REQUEST_INSTALL_PACKAGES deny >> "$CHANGES" 2>&1; then
       rollback_appops $changed
       log "FALHA grupo A em $pkg"
       return 1
     fi
-    after="$(adb_cmd shell cmd appops get "$pkg" REQUEST_INSTALL_PACKAGES 2>&1 | tr '\n' ' ')"
+    after="$(adb_cmd shell cmd appops get --user 0 "$pkg" REQUEST_INSTALL_PACKAGES 2>&1 | tr '\n' ' ')"
     if ! printf '%s' "$after" | grep -q 'deny'; then
-      rollback_appops $changed "$pkg"
+      rollback_appops $changed "$pkg:$old_appop"
       log "FALHA verificacao grupo A em $pkg: $after"
       return 1
     fi
-    changed="$changed $pkg"
+    changed="$changed $pkg:$old_appop"
     log "A aplicado $pkg: $after"
   done
   if ! home_ok; then
@@ -100,7 +110,7 @@ apply_group_a() {
     log "FALHA tela inicial grupo A; restaurado"
     return 1
   fi
-  for pkg in $changed; do record_restore_appops "$pkg"; done
+  for entry in $changed; do record_restore_appops "${entry%:*}" "${entry##*:}"; done
   log "GRUPO A CONCLUIDO"
 }
 
@@ -124,20 +134,82 @@ rollback_packages() {
   done
 }
 
+rollback_disabled() {
+  for disable_entry in "$@"; do
+    disable_pkg=${disable_entry%:*}
+    disable_restore=${disable_entry##*:}
+    adb_cmd shell pm "$disable_restore" --user 0 "$disable_pkg" >> "$CHANGES" 2>&1 || {
+      log "FALHA rollback de desativacao: $disable_pkg"; return 1
+    }
+  done
+}
+
+disable_shareme() {
+  # Specific fallback observed and tested on MIUI; do not disable other apps.
+  fallback_state=$(adb_cmd shell dumpsys package com.xiaomi.midrop | tr -d '\r' | sed -n 's/.*User 0:.* enabled=\([0-9]*\).*/\1/p')
+  case "$fallback_state" in
+    0) fallback_restore=default-state ;;
+    1) fallback_restore=enable ;;
+    2) fallback_restore=disable ;;
+    3) fallback_restore=disable-user ;;
+    4) fallback_restore=disable-until-used ;;
+    *) log "FALHA workaround ShareMe: estado anterior desconhecido"; return 1 ;;
+  esac
+  if [ "$fallback_state" = 3 ]; then
+    log "ShareMe ja estava disabled-user; estado preservado"
+    return 0
+  fi
+  if ! adb_cmd shell pm disable-user --user 0 com.xiaomi.midrop >> "$CHANGES" 2>&1; then
+    rollback_disabled "com.xiaomi.midrop:$fallback_restore" || true
+    log "FALHA workaround ShareMe: disable-user recusado"
+    return 1
+  fi
+  if ! adb_cmd shell pm list packages -d --user 0 com.xiaomi.midrop | tr -d '\r' | grep -qx 'package:com.xiaomi.midrop'; then
+    rollback_disabled "com.xiaomi.midrop:$fallback_restore" || true
+    log "FALHA workaround ShareMe: desativacao nao confirmada"
+    return 1
+  fi
+  log "WORKAROUND ShareMe: desativado no user 0; estado anterior=$fallback_state"
+}
+
 remove_group() {
   group="$1"
   shift
   changed=""
+  disabled_changed=""
+  shareme_disabled=no
   for pkg in "$@"; do
     if ! exact_package_present "$pkg"; then
       log "Grupo $group: $pkg ja ausente no user 0; nao registrado como removido"
       continue
     fi
+    if ! awk -F '\t' -v pkg="$pkg" '$1 == pkg && $5 == "REMOVER (aguarda aprovacao)" {found=1} END {exit !found}' "$OUT/app_plan.tsv"; then
+      log "Grupo $group: $pkg preservado pelo plano"
+      continue
+    fi
     hash_package "$pkg"
     result="$(adb_cmd shell pm uninstall --user 0 "$pkg" 2>&1 || true)"
     log "Grupo $group uninstall $pkg: $result"
+    if [ "$result" = 'Failure [-1000]' ] && exact_package_present "$pkg"; then
+      if [ "$pkg" = com.xiaomi.midrop ]; then
+        if ! disable_shareme; then
+          rollback_packages $changed
+          rollback_disabled $disabled_changed || true
+          return 1
+        fi
+        shareme_disabled=yes
+        if [ "$fallback_state" != 3 ]; then
+          disabled_changed="$disabled_changed com.xiaomi.midrop:$fallback_restore"
+        fi
+        continue
+      fi
+      printf '%s\t%s\t%s\n' "$group" "$pkg" "$result" >> "$OUT/skipped.txt"
+      log "Grupo $group: remocao recusada (-1000); $pkg preservado"
+      continue
+    fi
     if [ "$result" != "Success" ] || exact_package_present "$pkg"; then
       rollback_packages $changed
+      rollback_disabled $disabled_changed || true
       log "FALHA grupo $group em $pkg; grupo restaurado"
       return 1
     fi
@@ -145,6 +217,7 @@ remove_group() {
   done
   if ! home_ok; then
     rollback_packages $changed
+    rollback_disabled $disabled_changed || true
     log "FALHA tela inicial grupo $group; grupo restaurado"
     return 1
   fi
@@ -152,6 +225,17 @@ remove_group() {
     printf '%s\n' "$pkg" >> "$REMOVED"
     record_restore_package "$pkg"
   done
+  if [ "$shareme_disabled" = yes ]; then
+    if ! grep -Fxq com.xiaomi.midrop "$OUT/disabled.txt" 2>/dev/null; then
+      printf 'com.xiaomi.midrop\n' >> "$OUT/disabled.txt"
+    fi
+    for disable_entry in $disabled_changed; do
+      disable_pkg=${disable_entry%:*}
+      disable_restore=${disable_entry##*:}
+      printf '"$ADB" -s "$SERIAL" shell pm %s --user 0 %s\n' "$disable_restore" "$disable_pkg" >> "$RESTORE_SH"
+      printf '"%%ADB%%" -s %%SERIAL%% shell pm %s --user 0 %s\n' "$disable_restore" "$disable_pkg" >> "$RESTORE_BAT"
+    done
+  fi
   log "GRUPO $group CONCLUIDO:$changed"
 }
 
@@ -193,7 +277,19 @@ apply_group_e() {
     network_changed=no
   fi
   log "E antes: wifi=$old_wifi ble=$old_ble mode=$old_mode spec=$old_spec"
-  adb_cmd shell settings put global wifi_scan_always_enabled 0 >> "$CHANGES" 2>&1 || { restore_network; return 1; }
+  if first_write=$(adb_cmd shell settings put global wifi_scan_always_enabled 0 2>&1); then
+    printf '%s\n' "$first_write" >> "$CHANGES"
+  else
+    printf '%s\n' "$first_write" >> "$CHANGES"
+    if printf '%s' "$first_write" | grep -q 'Permission denial.*WRITE_SECURE_SETTINGS'; then
+      printf 'E\tglobal_settings\tWRITE_SECURE_SETTINGS denied; configure DNS/Wi-Fi/BLE manually\n' >> "$OUT/skipped.txt"
+      log "GRUPO E PENDENTE: firmware recusou WRITE_SECURE_SETTINGS antes de qualquer mudanca de rede"
+      printf 'Grupo E pendente: ADB sem permissao para configurar DNS/Wi-Fi/BLE. Consulte skipped.txt.\n'
+      return 0
+    fi
+    restore_network
+    return 1
+  fi
   adb_cmd shell settings put global ble_scan_always_enabled 0 >> "$CHANGES" 2>&1 || { restore_network; return 1; }
   adb_cmd shell settings put global private_dns_specifier dns.adguard-dns.com >> "$CHANGES" 2>&1 || { restore_network; return 1; }
   adb_cmd shell settings put global private_dns_mode hostname >> "$CHANGES" 2>&1 || { restore_network; return 1; }
@@ -240,13 +336,34 @@ if [ "$MODE" = "resume" ]; then
 else
   measure_snapshot "ANTES"
 fi
-apply_group_a || exit 10
-apply_trim || exit 20
-remove_group B br.com.gabba.Caixa com.vodafone.mCare com.geeksoftapps.whatsweb com.learnpainless.disable_system_apps com.google.android.apps.photos || exit 30
-remove_group D com.miui.msa.global com.miui.analytics || exit 40
-remove_group C1 com.miui.cloudbackup com.miui.micloudsync com.miui.cloudservice com.miui.cloudservice.sysbase com.xiaomi.payment com.mipay.wallet.id || exit 50
-remove_group C2 com.xiaomi.midrop com.miui.mishare.connectivity com.xiaomi.mi_connect_service com.xiaomi.miplay_client com.milink.service || exit 60
-apply_group_e || exit 70
+run_stage() {
+  stage=$1
+  shift
+  if [ "$MODE" = resume ] && grep -q "GRUPO $stage CONCLUIDO" "$CHANGES"; then
+    log "RETOMADA: grupo $stage ja concluido"
+    return 0
+  fi
+  "$@"
+}
+run_stage A apply_group_a || exit 10
+run_stage F apply_trim || exit 20
+run_stage B remove_group B br.com.gabba.Caixa com.vodafone.mCare com.geeksoftapps.whatsweb com.learnpainless.disable_system_apps com.google.android.apps.photos || exit 30
+run_stage D remove_group D com.miui.msa.global com.miui.analytics || exit 40
+run_stage C1 remove_group C1 com.miui.cloudbackup com.miui.micloudsync com.miui.cloudservice com.miui.cloudservice.sysbase com.xiaomi.payment com.mipay.wallet.id || exit 50
+run_stage C2 remove_group C2 com.xiaomi.midrop com.miui.mishare.connectivity com.xiaomi.mi_connect_service com.xiaomi.miplay_client com.milink.service || exit 60
+run_stage X remove_group X com.xiaomi.glgm com.xiaomi.mipicks com.mi.global.bbs || exit 65
+if [ -s "$OUT/optional_removals.txt" ]; then
+  set --
+  while IFS= read -r requested_pkg || [ -n "$requested_pkg" ]; do
+    [ -n "$requested_pkg" ] || continue
+    if ! printf '%s\n' "$requested_pkg" | LC_ALL=C grep -Eq '^([A-Za-z][A-Za-z0-9_]*\.)*[A-Za-z][A-Za-z0-9_]*$'; then
+      log "FALHA nome de pacote invalido na selecao: $requested_pkg"; exit 65
+    fi
+    set -- "$@" "$requested_pkg"
+  done < "$OUT/optional_removals.txt"
+  run_stage OPTIONAL remove_group OPTIONAL "$@" || exit 65
+fi
+run_stage E apply_group_e || exit 70
 
 avail_kb="$(adb_cmd shell df -k /data 2>/dev/null | tail -n 1 | awk '{print $4}')"
 charging="$(adb_cmd shell dumpsys battery 2>/dev/null | grep -E '^  (AC|USB) powered: true' | wc -l | tr -d ' ')"
