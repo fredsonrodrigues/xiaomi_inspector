@@ -41,13 +41,27 @@ present() { adb_cmd shell pm list packages --user 0 "$1" 2>/dev/null | tr -d '\r
     if present "$pkg"; then printf 'FALHA presente: %s\n' "$pkg"; else printf 'OK ausente: %s\n' "$pkg"; fi
   done
 
-  printf '\nApps protegidos amostrados:\n'
-  for pkg in com.chordbot com.dubox.drive com.google.android.apps.authenticator2 com.dts.freefireth com.brave.browser com.android.mms com.android.camera com.miui.gallery com.google.android.gms; do
+  printf '\nPacotes desativados pelo workaround (user 0):\n'
+  if [ -f "$OUT/disabled.txt" ]; then
+    while IFS= read -r pkg; do
+      [ -n "$pkg" ] || continue
+      if present "$pkg" && adb_cmd shell pm list packages -d --user 0 "$pkg" | tr -d '\r' | grep -qx "package:$pkg"; then
+        printf 'OK desativado: %s\n' "$pkg"
+      else
+        printf 'FALHA desativacao: %s\n' "$pkg"
+      fi
+    done < "$OUT/disabled.txt"
+  fi
+
+  printf '\nApps preservados (inventario anterior menos remocoes registradas):\n'
+  sed -n 's/^package://p' "$OUT/before.txt" | tr -d '\r' | while IFS= read -r pkg; do
+    grep -Fxq "$pkg" "$REMOVED" && continue
     if present "$pkg"; then printf 'OK presente: %s\n' "$pkg"; else printf 'FALHA ausente: %s\n' "$pkg"; fi
   done
 
   printf '\nREQUEST_INSTALL_PACKAGES:\n'
   for pkg in com.android.chrome com.brave.browser com.google.android.apps.docs com.miui.gallery; do
+    present "$pkg" || continue
     printf '%s: ' "$pkg"
     adb_cmd shell cmd appops get "$pkg" REQUEST_INSTALL_PACKAGES 2>&1 | tr '\n' ' '
     printf '\n'
@@ -67,7 +81,11 @@ present() { adb_cmd shell pm list packages --user 0 "$1" 2>/dev/null | tr -d '\r
   adb_cmd shell dumpsys window 2>/dev/null | grep -m 1 -E 'mCurrentFocus|mFocusedApp' || true
 
   printf '\nCompilacao:\n'
-  printf 'speed-profile foi iniciado, mas a saida terminou em 13/370 sem marcador de sucesso; resultado nao comprovado.\n'
+  printf 'speed-profile desativado por padrao. Consulte changes.txt.\n'
 } >> "$VERIFY"
 
+if grep -q '^FALHA ' "$VERIFY"; then
+  printf 'Verificacao encontrou divergencias: %s\n' "$VERIFY" >&2
+  exit 1
+fi
 printf 'VERIFICACAO_OK\n'

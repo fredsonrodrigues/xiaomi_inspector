@@ -1,22 +1,36 @@
 #!/bin/sh
-# Xiaomi Inspector — auditoria e limpeza ADB para o Xiaomi Mi 8 Lite (platina).
+# Xiaomi Inspector — auditoria e limpeza ADB para Xiaomi, Redmi e POCO.
 #
 # Este e um unico ponto de entrada para os scripts em ./scripts.
 # Ele nao faz root, nao desbloqueia bootloader, nao instala ROM e nunca apaga
 # arquivos pessoais. A aplicacao e deliberadamente restrita ao usuario 0.
 
-set -u
+set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ADB=${ADB:-"$ROOT_DIR/platform-tools/adb"}
-COMMAND=${1:-help}
+COMMAND=run
+if [ "$#" -gt 0 ]; then
+  case "$1" in -*) ;; *) COMMAND=$1; shift ;; esac
+fi
 SERIAL=${SERIAL:-}
-OUT=${OUT:-"$ROOT_DIR/results"}
-
-if [ "$#" -gt 0 ]; then shift; fi
+OUT=${OUT:-}
+ASSUME_YES=no
+RESUME=no
+OPTIONAL_REMOVALS=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --remove-app)
+      [ "$#" -ge 2 ] || { printf 'Falta o pacote de --remove-app\n' >&2; exit 2; }
+      if ! printf '%s\n' "$2" | LC_ALL=C grep -Eq '^([A-Za-z][A-Za-z0-9_]*\.)*[A-Za-z][A-Za-z0-9_]*$'; then
+        printf 'Nome de pacote invalido: %s\n' "$2" >&2; exit 2
+      fi
+      OPTIONAL_REMOVALS="$OPTIONAL_REMOVALS $2"
+      shift 2
+      ;;
+    --yes) ASSUME_YES=yes; shift ;;
+    --resume) RESUME=yes; shift ;;
     --serial)
       [ "$#" -ge 2 ] || { printf 'Falta o valor de --serial\n' >&2; exit 2; }
       SERIAL=$2
@@ -41,17 +55,37 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ -n "$OPTIONAL_REMOVALS" ]; then
+  case "$COMMAND:$RESUME" in
+    run:no|all:no|full:no|plan:no) ;;
+    *) printf 'Use --remove-app ao gerar o plano (plan ou fluxo novo), nao em apply/retomada.\n' >&2; exit 2 ;;
+  esac
+fi
+
+if [ -z "$OUT" ]; then
+  if [ "$RESUME" = yes ]; then
+    printf 'Informe --out DIRETORIO para retomar a execucao anterior.\n' >&2
+    exit 2
+  fi
+  case "$COMMAND" in
+    run|all|full) OUT="$ROOT_DIR/results/run_$(date '+%Y%m%d_%H%M%S')_$$" ;;
+    *) OUT="$ROOT_DIR/results" ;;
+  esac
+fi
+
 usage() {
   cat <<'EOF'
 Xiaomi Inspector — auditoria e limpeza ADB
 
 Uso:
+  ./xiaomi_inspector.sh [--serial SERIAL] [--out DIRETORIO] [--yes] [--resume]
   ./xiaomi_inspector.sh status
   ./xiaomi_inspector.sh scan [--serial SERIAL] [--out DIRETORIO]
   ./xiaomi_inspector.sh plan [--serial SERIAL] [--out DIRETORIO]
   ./xiaomi_inspector.sh apply [--serial SERIAL] [--out DIRETORIO]
   ./xiaomi_inspector.sh reboot-verify [--serial SERIAL] [--out DIRETORIO]
   ./xiaomi_inspector.sh all [--serial SERIAL] [--out DIRETORIO]
+  ./xiaomi_inspector.sh full [--serial SERIAL] [--out DIRETORIO]
   ./xiaomi_inspector.sh restore [--serial SERIAL] [--out DIRETORIO]
   ./xiaomi_inspector.sh report [--out DIRETORIO]
 
@@ -61,15 +95,20 @@ Comandos:
   plan            Baixa/copia a lista publica UAD e gera app_plan.tsv localmente.
   apply           Aplica os grupos aprovados neste projeto, com confirmacao digitada.
   reboot-verify   Reinicia, espera o boot, repousa 2 minutos e verifica o resultado.
-  all             Executa scan -> plan -> apply -> reboot-verify, com pausas de aprovacao.
+  run             Identifica -> scan -> plan -> confirmacao -> apply -> reboot -> report.
+  all, full       Aliases do mesmo fluxo run (compatibilidade).
   restore         Executa o restore.sh do diretorio de resultados, com confirmacao.
   report          Mostra os artefatos e o resumo automatico da execucao.
 
-Padrao de saida: ./results
+Saida do fluxo completo: ./results/run_DATA_HORA_PID
+Saida das etapas individuais: ./results (ou --out DIRETORIO)
 
 IMPORTANTE:
-  A etapa apply e especifica para Xiaomi Mi 8 Lite/platina e para as escolhas
-  feitas nesta conversa. Ela recusa outro modelo. Revise app_plan.tsv antes.
+  O perfil atual usa os grupos A/F/B/D/C/X/E e somente pacotes presentes.
+  --yes confirma aplicacao e reinicio. Revise app_plan.tsv antes de usar.
+  --resume retoma a mesma pasta/aparelho, sem repetir scan e grupos concluidos.
+  Padrao: remover Centro de Jogos, Mi Picks/GetApps e Comunidade Xiaomi se presentes.
+  --remove-app PACOTE: adicionar qualquer pacote exato ao plano (repetivel).
 EOF
 }
 
@@ -148,8 +187,9 @@ adb_cmd() {
 
 resolve_serial() {
   require_adb
-  devices=$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}')
-  unauthorized=$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="unauthorized" {print $1}')
+  listing=$("$ADB" devices) || exit 4
+  devices=$(printf '%s\n' "$listing" | awk 'NR>1 && $2=="device" {print $1}')
+  unauthorized=$(printf '%s\n' "$listing" | awk 'NR>1 && $2=="unauthorized" {print $1}')
 
   if [ -n "$SERIAL" ]; then
     if printf '%s\n' "$devices" | grep -qx "$SERIAL"; then return 0; fi
@@ -178,13 +218,21 @@ resolve_serial() {
   fi
 }
 
-require_platina() {
+require_xiaomi() {
   device=$(adb_cmd shell getprop ro.product.device 2>/dev/null | tr -d '\r')
   model=$(adb_cmd shell getprop ro.product.model 2>/dev/null | tr -d '\r')
-  if [ "$device" != platina ]; then
-    printf 'RECUSADO: apply foi escrito para Xiaomi Mi 8 Lite/platina; detectado %s (%s).\n' "$model" "$device" >&2
-    exit 5
-  fi
+  manufacturer=$(adb_cmd shell getprop ro.product.manufacturer | tr -d '\r' | tr '[:upper:]' '[:lower:]')
+  case "$manufacturer" in xiaomi|redmi|poco) ;; *)
+    printf 'Fabricante nao suportado: %s (%s).\n' "$manufacturer" "$model" >&2; exit 5 ;;
+  esac
+  printf 'Aparelho: %s (%s); perfil: current.\n' "$model" "$device"
+}
+
+require_run_device() {
+  [ -f "$OUT/device_serial.txt" ] && [ "$(cat "$OUT/device_serial.txt")" = "$SERIAL" ] || {
+    printf 'Resultados nao pertencem a este aparelho. Execute scan em uma pasta nova.\n' >&2
+    exit 8
+  }
 }
 
 check_device_owner() {
@@ -197,7 +245,14 @@ check_device_owner() {
 
 run_scan() {
   resolve_serial
+  require_xiaomi
   mkdir -p "$OUT"
+  if [ -f "$OUT/device_serial.txt" ]; then require_run_device; fi
+  if [ -f "$OUT/changes.txt" ]; then
+    printf 'Esta pasta ja contem uma aplicacao; use --out com uma pasta nova.\n' >&2
+    exit 8
+  fi
+  printf '%s\n' "$SERIAL" > "$OUT/device_serial.txt"
   printf 'Varredura somente leitura em %s (serial %s)...\n' "$OUT" "$SERIAL"
   sh "$ROOT_DIR/scripts/scan_android.sh" "$SERIAL" "$ADB" "$OUT"
   printf 'Revise: %s/scan.txt\n' "$OUT"
@@ -217,14 +272,19 @@ prepare_uad() {
 
 run_plan() {
   resolve_serial
-  require_platina
+  require_xiaomi
+  require_run_device
+  [ ! -f "$OUT/changes.txt" ] || {
+    printf 'O plano desta aplicacao ja foi usado; escolha uma pasta nova.\n' >&2; exit 8
+  }
   [ -f "$OUT/before.txt" ] && [ -f "$OUT/scan.txt" ] || {
     printf 'Execute scan antes de plan (faltam before.txt/scan.txt em %s).\n' "$OUT" >&2
     exit 8
   }
   command -v ruby >/dev/null 2>&1 || { printf 'Ruby nao encontrado; necessario para gerar o plano.\n' >&2; exit 8; }
   prepare_uad
-  ruby "$ROOT_DIR/scripts/build_plan.rb" "$OUT"
+  # Values are validated exact package identifiers above, so splitting is intentional.
+  ruby "$ROOT_DIR/scripts/build_plan.rb" "$OUT" $OPTIONAL_REMOVALS
   printf 'Revise antes de aprovar: %s/app_plan.tsv\n' "$OUT"
 }
 
@@ -250,16 +310,25 @@ Escopo fixo desta aplicacao:
   B  retirar do user 0: CAIXA, My Vodafone, WhatsWeb, Disable System Apps, Google Fotos
   D  retirar MIUI System Ads e Xiaomi Analytics
   C  retirar Mi Cloud/carteira/compartilhamento Xiaomi nao usados
+  X  retirar Centro de Jogos (com.xiaomi.glgm), Mi Picks (com.xiaomi.mipicks)
+     e Comunidade Xiaomi (com.mi.global.bbs), se presentes
   E  desligar scans Wi-Fi/BLE e configurar dns.adguard-dns.com
+
+ShareMe: se a remocao retornar Failure [-1000], tentar desativar no user 0.
 
 Preservados: ChordBot, apps proprios, TeraBox, bancos mantidos, jogos, 2FA,
 telefone/SMS, Camera/Galeria, conta Google e users 11/999.
 EOF
+  if [ -s "$OUT/optional_removals.txt" ]; then
+    printf '\nRemocoes opcionais selecionadas (somente se presentes no plano):\n'
+    cat "$OUT/optional_removals.txt"
+  fi
 }
 
 run_apply() {
   resolve_serial
-  require_platina
+  require_xiaomi
+  require_run_device
   check_device_owner
   [ -f "$OUT/app_plan.tsv" ] || {
     printf 'Execute plan e revise app_plan.tsv antes de apply.\n' >&2
@@ -269,10 +338,12 @@ run_apply() {
   printf '\nMantenha o aparelho conectado, desbloqueado e sem uso durante a aplicacao.\n'
   printf '\nConfirme que o backup de fotos e conversas existe.\n'
   printf 'Para aplicar somente no usuario 0, digite exatamente: APLICAR NO USUARIO 0\n> '
-  IFS= read -r answer
+  if [ "$ASSUME_YES" = yes ]; then answer='APLICAR NO USUARIO 0'; else IFS= read -r answer; fi
   [ "$answer" = 'APLICAR NO USUARIO 0' ] || { printf 'Cancelado sem alteracoes.\n'; exit 0; }
   init_apply_files
-  ENABLE_SETTINGS_BENCH=0 ENABLE_COMPILE=0 sh "$ROOT_DIR/scripts/apply_cleanup.sh" "$SERIAL" "$ADB" "$OUT"
+  apply_mode=full
+  [ "$RESUME" = no ] || apply_mode=resume
+  ENABLE_SETTINGS_BENCH=0 ENABLE_COMPILE=0 sh "$ROOT_DIR/scripts/apply_cleanup.sh" "$SERIAL" "$ADB" "$OUT" "$apply_mode"
   printf 'Aplicacao terminou. Revise %s/changes.txt antes de reiniciar.\n' "$OUT"
 }
 
@@ -289,8 +360,12 @@ write_execution_summary() {
     grep -E '^(=====|Data-Free:|Apps ativos user 0:|/dev/block/)' "$OUT/measurements.txt" 2>/dev/null || true
     printf '\nPacotes removidos:\n'
     sed '1,2d' "$OUT/removed.txt" 2>/dev/null || true
+    printf '\nPacotes desativados pelo workaround:\n'
+    if [ -f "$OUT/disabled.txt" ]; then cat "$OUT/disabled.txt"; fi
+    printf '\nEtapas/pacotes preservados ou pendentes:\n'
+    if [ -f "$OUT/skipped.txt" ]; then cat "$OUT/skipped.txt"; fi
     printf '\nVerificacao:\n'
-    grep -E '^(sys.boot_completed|OK ausente|OK presente|wifi_scan|ble_scan|private_dns|DNS AdGuard|Ping)' "$OUT/final_verification.txt" 2>/dev/null || true
+    grep -E '^(sys.boot_completed|OK ausente|OK presente|OK desativado|wifi_scan|ble_scan|private_dns|DNS AdGuard|Ping)' "$OUT/final_verification.txt" 2>/dev/null || true
     printf '\nLimitacoes:\n'
     printf '%s\n' '- ADB nao prova ausencia de malware.'
     printf '%s\n' '- Testes de ligacao, SMS, banco, 2FA, Bluetooth, camera e Segundo Espaco sao manuais.'
@@ -300,10 +375,11 @@ write_execution_summary() {
 
 run_reboot_verify() {
   resolve_serial
-  require_platina
+  require_xiaomi
+  require_run_device
   [ -f "$OUT/removed.txt" ] || { printf 'Falta removed.txt; execute apply primeiro.\n' >&2; exit 10; }
   printf 'Digite REINICIAR para reiniciar, aguardar o boot e medir apos 2 minutos:\n> '
-  IFS= read -r answer
+  if [ "$ASSUME_YES" = yes ]; then answer=REINICIAR; else IFS= read -r answer; fi
   [ "$answer" = REINICIAR ] || { printf 'Reinicio cancelado.\n'; exit 0; }
   adb_cmd reboot
   printf 'Aguardando o aparelho reaparecer...\n'
@@ -317,7 +393,10 @@ run_reboot_verify() {
   done
   [ "$ready" = yes ] || { printf 'Timeout: desbloqueie o aparelho e execute reboot-verify novamente.\n' >&2; exit 11; }
   printf 'Boot concluido. Nao toque no aparelho por 120 segundos...\n'
-  sleep 120
+  for idle_tick in 1 2 3 4; do
+    sleep 30
+    printf 'Repouso: %s/4 intervalos concluidos.\n' "$idle_tick"
+  done
   sh "$ROOT_DIR/scripts/verify_after.sh" "$SERIAL" "$ADB" "$OUT"
   write_execution_summary
   printf 'Verificacao concluida: %s/final_verification.txt\n' "$OUT"
@@ -325,7 +404,8 @@ run_reboot_verify() {
 
 run_restore() {
   resolve_serial
-  require_platina
+  require_xiaomi
+  require_run_device
   [ -f "$OUT/restore.sh" ] || { printf 'Falta %s/restore.sh\n' "$OUT" >&2; exit 12; }
   printf 'A restauracao reativa pacotes/permissoes registrados nessa execucao.\n'
   printf 'Digite RESTAURAR para continuar:\n> '
@@ -337,13 +417,30 @@ run_restore() {
 
 run_report() {
   printf 'Diretorio: %s\n' "$OUT"
-  for file in device.txt scan.txt before.txt app_plan.tsv measurements.txt removed.txt changes.txt restore.sh restore.bat final_verification.txt execution_summary.txt summary.txt approval_plan.txt uad_lists.json; do
+  for file in device_serial.txt device.txt scan.txt before.txt app_plan.tsv optional_removals.txt measurements.txt removed.txt disabled.txt skipped.txt changes.txt restore.sh restore.bat final_verification.txt execution_summary.txt summary.txt approval_plan.txt uad_lists.json; do
     if [ -f "$OUT/$file" ]; then printf '  %s\n' "$OUT/$file"; fi
   done
   if [ -f "$OUT/execution_summary.txt" ]; then
     printf '\n'
     cat "$OUT/execution_summary.txt"
   fi
+}
+
+run_workflow() {
+  resolve_serial
+  require_xiaomi
+  if [ "$RESUME" = yes ]; then
+    require_run_device
+    [ -f "$OUT/changes.txt" ] && [ -f "$OUT/app_plan.tsv" ] || {
+      printf 'Nao ha aplicacao para retomar nesta pasta.\n' >&2; exit 8
+    }
+  else
+    run_scan
+    run_plan
+  fi
+  run_apply
+  run_reboot_verify
+  run_report
 }
 
 case "$COMMAND" in
@@ -355,13 +452,7 @@ case "$COMMAND" in
   reboot-verify) run_reboot_verify ;;
   restore) run_restore ;;
   report) run_report ;;
-  all)
-    run_scan
-    run_plan
-    run_apply
-    run_reboot_verify
-    run_report
-    ;;
+  run|all|full) run_workflow ;;
   *)
     printf 'Comando desconhecido: %s\n\n' "$COMMAND" >&2
     usage >&2

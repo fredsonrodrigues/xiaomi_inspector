@@ -2,7 +2,7 @@
 
 [Documentação em português](docs/README.pt-BR.md)
 
-Xiaomi Inspector is a shell-based workflow for auditing, planning, applying, and verifying a controlled cleanup of a **Xiaomi Phone(`platina`)** through ADB, without root.
+Xiaomi Inspector audits, plans, applies, and verifies a controlled cleanup of Xiaomi, Redmi, and POCO phones through ADB, without root.
 
 The main entry point is [`xiaomi_inspector.sh`](./xiaomi_inspector.sh). It runs a read-only scan first, generates a package plan, requires explicit confirmation before changes, records hashes and actions, creates restoration scripts, and verifies the device after reboot.
 
@@ -33,18 +33,24 @@ It does **not**:
 - disable Play Protect or system security features;
 - update the Android security patch.
 
-## Device-specific limitation
+## Automatic device detection
 
-The read-only scan can inspect other Android devices. However, `plan`, `apply`, `reboot-verify`, and `restore` are tailored to the device and decisions documented in this project:
+All Xiaomi, Redmi, and POCO devices use the same workflow and current cleanup
+profile. The program detects the manufacturer, model, and codename automatically;
+`eos` and `platina` do not require separate commands. Manufacturer support is not
+a guarantee that every firmware supports every operation: a failed stage stops
+the workflow.
 
-- Xiaomi Mi 8 Lite;
-- device codename `platina`;
-- Android 10 / MIUI 12 Global;
-- primary user 0;
-- Second Space/XSpace users 11 and 999;
-- the approved package selection from the original audit.
+The profile retains the original approved groups A → F → B → D → C → E. Only
+installed packages listed for removal in the generated plan are removed.
+Missing apps are skipped, the default launcher is detected, and verification
+compares the actual initial inventory with recorded removals. Review the plan
+because the profile still encodes the owner's choices (including Google Photos,
+CAIXA, My Vodafone, and Xiaomi cloud/sharing removal).
 
-Before applying changes, the program checks `ro.product.device` and **refuses any device other than `platina`**. Do not reuse this removal list on another phone without a new audit.
+Each scan records the serial in `device_serial.txt`. Later stages reject results
+from another phone. Use a new output folder for each complete run; a folder with
+an existing cleanup log cannot be scanned again.
 
 ## Requirements
 
@@ -82,7 +88,9 @@ Before first use:
     └── verify_after.sh
 ```
 
-After the first ADB command, `platform-tools/` is created automatically. Execution artifacts are stored in `results/` by default.
+After the first ADB command, `platform-tools/` is created automatically. Complete
+runs create their own `results/run_DATE_TIME_PID/` folder. Individual stages use
+`results/` unless `--out` or `OUT` selects another folder.
 
 ## Prepare the phone
 
@@ -106,21 +114,54 @@ The first call may download Platform Tools. If multiple devices are connected, a
 
 ## Quick start
 
-### Full workflow
+### Complete workflow
 
 ```sh
-./xiaomi_inspector.sh all
+./xiaomi_inspector.sh
+# Or choose a folder explicitly:
+./xiaomi_inspector.sh --out results/my_phone_run
 ```
 
-The default output directory is `./results`.
-
-The workflow is:
+With no command, the program creates a new run folder under `results/` and runs:
 
 ```text
-scan → review → plan → approval → apply → reboot → idle period → verification
+identify → scan → plan → approval → apply → reboot → idle period → verification → report
 ```
 
-Even in `all` mode, Xiaomi Inspector stops for explicit confirmation before applying changes and before rebooting.
+The workflow asks for confirmation before applying changes and rebooting.
+For an already approved unattended run, use `--yes`:
+
+```sh
+./xiaomi_inspector.sh --out results/my_phone_run --yes
+```
+
+`run`, `all`, and `full` are aliases for this same complete workflow.
+**Behavior change:** `all` now includes cleanup and reboot; use `scan` for a
+read-only audit.
+
+If a stage fails, resume the same phone and output folder with:
+
+```sh
+./xiaomi_inspector.sh --out results/my_phone_run --resume
+```
+
+Completed cleanup groups are skipped. If ShareMe (`com.xiaomi.midrop`) returns
+`Failure [-1000]` on removal and remains installed, the workflow instead tries
+`pm disable-user --user 0`. It checks the disabled-package list and the launcher,
+records the package in `disabled.txt` (not `removed.txt`), and generates restoration
+commands for its previous enabled state. An already disabled ShareMe is kept
+disabled without generating a command that would re-enable it. If disabling or
+verification fails, the group stops and attempts to restore its changes. Final
+verification also checks that ShareMe remains disabled.
+
+This fallback applies only to ShareMe and that specific uninstall response.
+Other packages returning `Failure [-1000]` remain preserved in `skipped.txt`;
+other removal errors interrupt the workflow. A resumed run skips groups already
+completed before this change; start a new run to evaluate the updated profile.
+If the first network-setting write is denied with `WRITE_SECURE_SETTINGS`, the
+network group is recorded as pending and the workflow continues. Configure
+Private DNS and Wi-Fi/BLE scanning manually on that phone; the summary includes
+the pending task.
 
 ### Recommended staged workflow
 
@@ -133,11 +174,53 @@ Even in `all` mode, Xiaomi Inspector stops for explicit confirmation before appl
 ```
 
 Running each stage separately lets you review `results/scan.txt` and `results/app_plan.tsv` before any changes.
+To resume an automatic run, supply its printed folder with `--out` to every stage.
+
+### Default Xiaomi apps and custom removals
+
+These apps are included in the default cleanup. Missing packages are skipped:
+
+| App | Exact package |
+|---|---|
+| Game Center / Centro de Jogos | `com.xiaomi.glgm` |
+| Mi Picks / GetApps | `com.xiaomi.mipicks` |
+| Xiaomi Community | `com.mi.global.bbs` |
+
+```sh
+./xiaomi_inspector.sh
+```
+
+To add any other installed app, repeat `--remove-app` with its full package ID.
+There is no package allowlist. For example (replace the example IDs):
+
+```sh
+./xiaomi_inspector.sh --remove-app org.example.reader --remove-app com.example.other
+```
+
+This invokes the normal complete workflow, including its confirmations. Explicit
+selections override keep/protect classifications in the plan, so review the
+package, dependencies and local app data before confirming application. For a
+read-only review, first run `scan --out results/review`, then:
+
+```sh
+./xiaomi_inspector.sh plan --out results/review --remove-app org.example.reader
+```
+
+Additional selections are stored in `optional_removals.txt`; only exact matches
+in the inventory are marked for removal, including explicitly selected disabled
+apps. No matching package means no removal. Package IDs must contain valid
+letters/digits/underscores in dot-separated segments; wildcards, spaces and shell
+expressions are rejected. Removal uses the existing logging, launcher validation, rollback,
+restoration and final verification. Select options during `plan` or a new complete
+run; `apply` and `--resume` use the saved plan without accepting new selections.
+
+The latest endpoint-log investigation is documented in
+[Endpoint audit — 2026-11-12](docs/network/ENDPOINT_AUDIT_2026-11-12.md).
 
 Use a different output directory for an independent run:
 
 ```sh
-./xiaomi_inspector.sh all --out results_20261106
+./xiaomi_inspector.sh --out results/another_run
 ```
 
 ## Commands
@@ -249,6 +332,9 @@ Supported options:
 ```text
 --serial SERIAL
 --out DIRECTORY
+--yes             Confirm cleanup and reboot in an already approved run
+--resume          Resume an existing run on the same device
+--remove-app PACKAGE  Optional exact package selection; repeat for each app
 ```
 
 Supported environment overrides:
@@ -267,24 +353,40 @@ SERIAL=63ea88ab OUT="$PWD/results_test" ./xiaomi_inspector.sh scan
 
 ## Generated files
 
-All execution artifacts are written to `results/` by default, using English filenames:
+Execution artifacts use English filenames in the selected output folder:
 
 | File | Purpose |
 |---|---|
+| `device_serial.txt` | Binds the run to the scanned device |
 | `device.txt` | Filtered device/build properties; do not publish without review |
 | `scan.txt` | Raw, sanitized ADB scan |
 | `before.txt` | Enabled packages before application |
 | `uad_lists.json` | Local copy of the public UAD-NG package list |
 | `app_plan.tsv` | Package classification and restoration guidance |
+| `optional_removals.txt` | Exact optional package IDs selected when generating the plan |
 | `measurements.txt` | Storage, memory, temperature, and package counts before/after |
 | `changes.txt` | Commands, results, and SHA-256 hashes |
 | `removed.txt` | Packages actually removed from user 0 |
+| `disabled.txt` | Installed packages disabled by the ShareMe workaround |
+| `skipped.txt` | Refused removals and pending configuration changes |
 | `restore.sh` | Restoration commands for macOS/Linux |
 | `restore.bat` | Restoration commands for Windows |
 | `final_verification.txt` | Post-reboot verification |
 | `execution_summary.txt` | Automatically generated run summary |
 | `summary.txt` | Historical/manual consolidated report, when present |
 | `approval_plan.txt` | Historical/manual approval plan, when present |
+
+## Development checks
+
+```sh
+ruby tests/workflow_test.rb
+sh -n xiaomi_inspector.sh
+sh -n scripts/apply_cleanup.sh
+sh -n scripts/verify_after.sh
+ruby -c scripts/build_plan.rb
+```
+
+Tests use a simulated ADB executable and do not touch a connected phone.
 
 ## Privacy
 

@@ -3,8 +3,19 @@ require "json"
 require "set"
 
 root = ARGV[0] || "results"
+default_xiaomi_apps = {
+  "com.xiaomi.glgm" => ["Centro de Jogos", "Xiaomi Game Center / Xiaomi Games"],
+  "com.xiaomi.mipicks" => ["Mi Picks / GetApps", "Loja de aplicativos Xiaomi"],
+  "com.mi.global.bbs" => ["Comunidade Xiaomi", "Comunidade e forum Xiaomi"]
+}
+optional_selected = ARGV.drop(1).uniq
+invalid = optional_selected.reject { |pkg| pkg.match?(/\A(?:[A-Za-z][A-Za-z0-9_]*\.)*[A-Za-z][A-Za-z0-9_]*\z/) }
+abort "Nomes de pacotes invalidos: #{invalid.join(', ')}" unless invalid.empty?
 active = File.readlines(File.join(root, "before.txt"), chomp: true).grep(/^package:/).map { |x| x.sub("package:", "") }
 scan = File.read(File.join(root, "scan.txt"))
+disabled_block = scan[/===== APPS DESATIVADOS -- USER 0 =====\n(.*?)\n===== APPS DE SISTEMA/m, 1] || ""
+disabled = disabled_block.lines.grep(/^package:/).map { |line| line.strip.sub("package:", "") }
+active = (active + ((optional_selected + default_xiaomi_apps.keys) & disabled)).uniq
 uad = JSON.parse(File.read(File.join(root, "uad_lists.json")))
 
 third_block = scan[/===== APPS DE TERCEIROS -- USER 0 =====\n(.*?)\n===== INSTALADORES/m, 1] || ""
@@ -59,9 +70,10 @@ protected_exact = Set.new(%w[
   com.miui.home com.google.android.googlequicksearchbox com.xiaomi.finddevice com.miui.securitycenter
   com.miui.powerkeeper com.lbe.security.miui com.goodix.fingerprint com.xiaomi.account
   com.adsum.qpagapp com.adsum.multi_checker_2 com.adsum.duobusmobile com.adsum.betadelivery
-  com.dev.adsum com.imesc.imescquestionario com.dubox.drive com.dts.freefireth
+  com.chordbot com.dev.adsum com.imesc.imescquestionario com.dubox.drive com.dts.freefireth
   com.gamestar.pianoperfect com.firsttouchgames.dls7 com.google.android.play.games
 ])
+known.merge!(default_xiaomi_apps)
 
 protected_patterns = [
   /^com\.android\.providers\./, /^com\.android\.networkstack/, /^com\.google\.android\.overlay\./,
@@ -71,9 +83,7 @@ protected_patterns = [
   /^com\.coinbase\./, /^br\.com\.digio$/, /^br\.com\.modalmais$/,
 ]
 
-suspicious = Set.new(%w[
-  com.chordbot
-])
+suspicious = Set.new
 
 remove_confirmed = Set.new(%w[
   br.com.gabba.Caixa com.vodafone.mCare com.geeksoftapps.whatsweb
@@ -83,6 +93,8 @@ remove_confirmed = Set.new(%w[
   com.xiaomi.midrop com.miui.mishare.connectivity com.xiaomi.mi_connect_service
   com.xiaomi.miplay_client com.milink.service
 ])
+remove_confirmed.merge(optional_selected)
+remove_confirmed.merge(default_xiaomi_apps.keys)
 
 def safe_tsv(value)
   value.to_s.gsub(/[\t\r\n]+/, " ").strip
@@ -98,7 +110,7 @@ File.open(out, "w") do |f|
 
     if remove_confirmed.include?(pkg)
       recommendation = "REMOVER (aguarda aprovacao)"
-      risk = "Uso negado pelo dono; revisar dependencias e remover somente do usuario 0"
+      risk = optional_selected.include?(pkg) ? "Remocao explicita do cliente; revisar dependencias e dados locais, somente usuario 0" : "Perfil padrao aprovado; revisar dependencias e remover somente do usuario 0"
       back = third.include?(pkg) ? "Reinstalar pela loja/backup ou install-existing se permanecer noutro usuario" : "cmd package install-existing --user 0 #{pkg}"
     elsif suspicious.include?(pkg)
       recommendation = "SUSPEITO"
@@ -118,8 +130,9 @@ File.open(out, "w") do |f|
       back = third.include?(pkg) ? "Reinstalar pela loja/backup" : "cmd package install-existing --user 0 #{pkg}"
     end
 
-    f.puts [pkg, name, function, "ativo", recommendation, risk, back].map { |x| safe_tsv(x) }.join("\t")
+    f.puts [pkg, name, function, disabled.include?(pkg) ? "desativado" : "ativo", recommendation, risk, back].map { |x| safe_tsv(x) }.join("\t")
   end
 end
 
 puts "Plano criado: #{out} (#{active.length} pacotes)"
+File.write(File.join(root, "optional_removals.txt"), optional_selected.map { |pkg| "#{pkg}\n" }.join)
